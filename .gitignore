@@ -1,0 +1,93 @@
+# ------------------------------
+# Python bytecode and caches
+# ------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ------------------------------
+# Virtual environments
+# ------------------------------
+.venv/
+venv/
+env/
+.env/
+.conda/
+pyvenv.cfg
+
+# ------------------------------
+# Packaging / distribution
+# ------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ------------------------------
+# Test artifacts
+# ------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# ------------------------------
+# Caches and tooling
+# ------------------------------
+.cache/
+.mypy_cache/
+.ruff_cache/
+__pypackages__/
+
+# ------------------------------
+# Editors / IDEs
+# ------------------------------
+.vscode/
+.idea/
+*.code-workspace
+
+# ------------------------------
+# OS-generated files
+# ------------------------------
+.DS_Store
+Thumbs.db
+
+# ------------------------------
+# Streamlit
+# ------------------------------
+.streamlit/
+!/.streamlit/config.toml
+# Avoid committing secrets
+.streamlit/secrets.toml
+
+# ------------------------------
+# Logs and temp files
+# ------------------------------
+*.log
+logs/
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# ------------------------------
+# Local databases
+# ------------------------------
+*.sqlite3
+*.db
+
+# ------------------------------
+# Misc
+# ------------------------------
+.python-version
+.ipynb_checkpoints/
+
+# ------------------------------
+# Project-specific (avoid committing local env)
+# ------------------------------
+table_det/
