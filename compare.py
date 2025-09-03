@@ -5,6 +5,15 @@ import pandas as pd
 from difflib import SequenceMatcher
 import streamlit as st
 from scorers import SCORER_REGISTRY
+from PIL import Image, ImageDraw, ImageFont
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    _REPORTLAB_AVAILABLE = True
+except Exception:
+    _REPORTLAB_AVAILABLE = False
 try:
     import scorers.embed_cosine  # noqa: F401
     _EMBED_AVAILABLE = True
@@ -548,6 +557,501 @@ if archivo is not None:
                 )
             except Exception:
                 st.dataframe(df_view.head(int(max_filas)), use_container_width=True)
+
+            # ---------- Descarga como PDF (paisaje) ----------
+            def _load_font(size: int = 14):
+                try:
+                    return ImageFont.truetype("DejaVuSans.ttf", size)
+                except Exception:
+                    try:
+                        return ImageFont.truetype("Arial.ttf", size)
+                    except Exception:
+                        return ImageFont.load_default()
+
+            def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int):
+                if text is None or (isinstance(text, float) and pd.isna(text)):
+                    return [""]
+                s = str(text)
+                # simple wrap by words
+                words = s.split()
+                lines = []
+                cur = ""
+                for w in words:
+                    test = (cur + (" " if cur else "") + w).strip()
+                    if draw.textlength(test, font=font) <= max_width:
+                        cur = test
+                    else:
+                        if cur:
+                            lines.append(cur)
+                        # if single word longer than max_width, hard split
+                        if draw.textlength(w, font=font) <= max_width:
+                            cur = w
+                        else:
+                            # naive hard wrap
+                            tmp = ""
+                            for ch in w:
+                                if draw.textlength(tmp + ch, font=font) <= max_width:
+                                    tmp += ch
+                                else:
+                                    if tmp:
+                                        lines.append(tmp)
+                                    tmp = ch
+                            cur = tmp
+                if cur:
+                    lines.append(cur)
+                return lines or [""]
+
+            def _line_height(font_obj: ImageFont.ImageFont) -> int:
+                try:
+                    return int(getattr(font_obj, "size", None) or font_obj.getbbox("Ag")[3]) + 2
+                except Exception:
+                    try:
+                        return int(font_obj.getsize("Ag")[1]) + 2
+                    except Exception:
+                        return 16
+
+            def dataframe_to_pdf_bytes_pil(dfpdf: pd.DataFrame, title: str | None = None, scale: float = 1.0) -> bytes:
+                # Configuración de página paisaje (ancho > alto)
+                scale = max(1.0, float(scale))
+                margin = int(30 * scale)
+                pad_x = int(8 * scale)
+                pad_y = int(6 * scale)
+                header_bg = (217, 217, 217)  # gris plomo
+                grid_color = (200, 200, 200)
+                text_color = (0, 0, 0)
+                # Colores de resaltado (alineados a la vista Streamlit)
+                COL_GREEN = (212, 237, 218)   # mayor score pares
+                COL_YELLOW = (255, 243, 205)  # IGUALES
+                COL_BLUE = (207, 226, 255)    # PROPUESTA USUARIO en ganador_*
+                COL_ORANGE = (255, 216, 168)  # PROPUESTA IA en ganador_*
+                COL_DARKBLUE = (0, 51, 102)   # headers de ganador_* (ya no usado, se deja por compat)
+                font = _load_font(int(14 * scale))
+                font_bold = _load_font(int(16 * scale))
+
+                # Definir anchos por tipo de columna
+                def is_score_col(cname: str) -> bool:
+                    s = str(cname)
+                    return s.startswith("score_")
+                def is_winner_col(cname: str) -> bool:
+                    return str(cname).startswith("ganador_") or str(cname) == "ganador_columna"
+                def _map_winner_text(v: object) -> str:
+                    if isinstance(v, str):
+                        if v == "PROPUESTA USUARIO":
+                            return "USUARIO"
+                        if v == "PROPUESTA IA":
+                            return "IA"
+                        if v == "IGUALES":
+                            return "IGUALES"
+                    return ""
+                def _fmt_score(val) -> str:
+                    try:
+                        vv = pd.to_numeric(val, errors="coerce")
+                        if pd.isna(vv):
+                            return ""
+                        return f"{float(vv):.2f}"
+                    except Exception:
+                        return ""
+
+                col_widths = []
+                for c in dfpdf.columns:
+                    if is_winner_col(c):
+                        col_widths.append(int(150 * scale))
+                    elif is_score_col(c):
+                        col_widths.append(int(120 * scale))
+                    else:
+                        col_widths.append(int(380 * scale))
+
+                # Pares de columnas de score (para colorear mayor/IGUALES)
+                score_pairs = [
+                    ("score_cliente_vs_usuario_tok", "score_cliente_vs_IA_tok"),
+                    ("score_cliente_vs_usuario_tfidf", "score_cliente_vs_IA_tfidf"),
+                    ("score_cliente_vs_usuario_embed", "score_cliente_vs_IA_embed"),
+                    ("score_cliente_vs_usuario", "score_cliente_vs_IA"),
+                ]
+                pair_index = {}
+                for u, i in score_pairs:
+                    pair_index[u] = (u, i)
+                    pair_index[i] = (u, i)
+
+                def _to_float(val):
+                    try:
+                        v = pd.to_numeric(val, errors="coerce")
+                        if pd.isna(v):
+                            return None
+                        return float(v)
+                    except Exception:
+                        return None
+
+                def _cell_bg_color(row: pd.Series, col_name: str):
+                    # Ganadores: colorear según valor
+                    if str(col_name).startswith("ganador_") or str(col_name) == "ganador_columna":
+                        v = row.get(col_name)
+                        if isinstance(v, str):
+                            if v == "PROPUESTA USUARIO":
+                                return COL_BLUE
+                            if v == "PROPUESTA IA":
+                                return COL_ORANGE
+                            if v == "IGUALES":
+                                return COL_YELLOW
+                        return None
+                    # Scores por pares: verde al mayor, amarillo si IGUALES
+                    if col_name in pair_index:
+                        ucol, icol = pair_index[col_name]
+                        u = _to_float(row.get(ucol)) if ucol in row.index else None
+                        i = _to_float(row.get(icol)) if icol in row.index else None
+                        if (u is not None) and (i is not None):
+                            if abs(i - u) <= 1e-9:
+                                return COL_YELLOW
+                            if (col_name == icol and i > u) or (col_name == ucol and u > i):
+                                return COL_GREEN
+                            return None
+                        # Solo uno válido → ese en verde
+                        if (col_name == icol and (i is not None) and (u is None)) or (col_name == ucol and (u is not None) and (i is None)):
+                            return COL_GREEN
+                        return None
+                    return None
+
+                # Calcular alto por fila en base al wrap
+                dummy_img = Image.new("RGB", (1, 1), "white")
+                draw = ImageDraw.Draw(dummy_img)
+                header_h = 0
+                # Header height
+                for c, w in zip(dfpdf.columns, col_widths):
+                    lines = _wrap_text(draw, str(c), font_bold, w - 2 * pad_x)
+                    header_h = max(header_h, len(lines) * (_line_height(font_bold)) + 2 * pad_y)
+
+                row_heights = []
+                for _, row in dfpdf.iterrows():
+                    rh = 0
+                    for (c, w) in zip(dfpdf.columns, col_widths):
+                        val = row.get(c)
+                        if is_winner_col(c):
+                            val = _map_winner_text(val)
+                        elif is_score_col(c):
+                            val = _fmt_score(val)
+                        lines = _wrap_text(draw, val, font, w - 2 * pad_x)
+                        rh = max(rh, len(lines) * (_line_height(font)) + 2 * pad_y)
+                    row_heights.append(rh)
+
+                table_width = sum(col_widths) + (len(col_widths) + 1)  # + grid lines
+                table_height = header_h + sum(row_heights) + (len(row_heights) + 2)
+
+                # Asegurar paisaje: si demasiado alto, incrementa ancho base
+                img_w = max(int(1600 * scale), table_width + 2 * margin)
+                img_h = table_height + 2 * margin
+                # Si aún no es paisaje, ensanchar
+                if img_w <= img_h:
+                    img_w = img_h + int(400 * scale)
+
+                img = Image.new("RGB", (img_w, img_h), "white")
+                dr = ImageDraw.Draw(img)
+
+                x = margin
+                y = margin
+                # Función de color de encabezado por columna (esquema de colores)
+                def _header_bg_for_col(cname: str):
+                    # Todos gris; ganador_* ahora fondo blanco
+                    if str(cname).startswith("ganador_") or str(cname) == "ganador_columna":
+                        return (255, 255, 255)
+                    return header_bg
+
+                # Dibujar headers con fondo por columna
+                cx = x + 1
+                for c, w in zip(dfpdf.columns, col_widths):
+                    cell_w = w
+                    # fondo por columna
+                    hdr_bg = _header_bg_for_col(c)
+                    dr.rectangle([cx, y, cx + cell_w, y + header_h], fill=hdr_bg, outline=grid_color)
+                    txt_lines = _wrap_text(dr, str(c), font_bold, cell_w - 2 * pad_x)
+                    ty = y + pad_y
+                    # texto negro para ganador_* (fondo blanco)
+                    hdr_text_color = text_color
+                    for line in txt_lines:
+                        dr.text((cx + pad_x, ty), line, fill=hdr_text_color, font=font_bold)
+                        ty += _line_height(font_bold)
+                    # vertical grid line
+                    dr.line([(cx + cell_w, y), (cx + cell_w, y + header_h)], fill=grid_color)
+                    cx += cell_w + 1
+
+                # horizontal line under header
+                dr.line([(x, y + header_h), (x + table_width, y + header_h)], fill=grid_color)
+
+                # Dibujar filas
+                cy = y + header_h + 1
+                for r_idx in range(len(dfpdf)):
+                    row = dfpdf.iloc[r_idx]
+                    cx = x + 1
+                    # calcular alto de la fila (precalculado)
+                    rh = row_heights[r_idx]
+                    # celdas
+                    for c_idx, (c, w) in enumerate(zip(dfpdf.columns, col_widths)):
+                        val = row.get(c)
+                        if is_winner_col(c):
+                            val = _map_winner_text(val)
+                        elif is_score_col(c):
+                            val = _fmt_score(val)
+                        cell_w = w
+                        # fondo según reglas
+                        bg = _cell_bg_color(row, str(c))
+                        if bg is not None:
+                            dr.rectangle([cx, cy - 1, cx + cell_w, cy + rh], fill=bg)
+                        # texto
+                        lines = _wrap_text(dr, val, font, cell_w - 2 * pad_x)
+                        ty = cy + pad_y
+                        for line in lines:
+                            dr.text((cx + pad_x, ty), line, fill=text_color, font=font)
+                            ty += _line_height(font)
+                        # bordes verticales
+                        dr.line([(cx + cell_w, cy - 1), (cx + cell_w, cy + rh)], fill=grid_color)
+                        cx += cell_w + 1
+                    # bordes horizontales
+                    dr.line([(x, cy + rh), (x + table_width, cy + rh)], fill=grid_color)
+                    cy += rh + 1
+
+                # Exportar a PDF
+                bio = io.BytesIO()
+                img.save(bio, format="PDF", resolution=300.0)
+                return bio.getvalue()
+
+            def dataframe_to_pdf_bytes_reportlab(dfpdf: pd.DataFrame, df_summary: pd.DataFrame | None = None, title: str | None = None, font_size: int = 9) -> bytes:
+                # Colores (RGB 0-1)
+                COL_GREEN = rl_colors.Color(212/255.0, 237/255.0, 218/255.0)
+                COL_YELLOW = rl_colors.Color(255/255.0, 243/255.0, 205/255.0)
+                COL_BLUE = rl_colors.Color(207/255.0, 226/255.0, 255/255.0)
+                COL_ORANGE = rl_colors.Color(255/255.0, 216/255.0, 168/255.0)
+                HEADER_BG = rl_colors.Color(217/255.0, 217/255.0, 217/255.0)  # gris plomo
+                HEADER_DARKBLUE = rl_colors.Color(0/255.0, 51/255.0, 102/255.0)
+                GRID = rl_colors.Color(200/255.0, 200/255.0, 200/255.0)
+
+                buf = io.BytesIO()
+                doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+                styles = getSampleStyleSheet()
+                body = styles["BodyText"]
+                body.fontSize = font_size
+                body.leading = int(font_size * 1.2)
+
+                # Prepare data with Paragraphs for wrapping
+                def is_score_col(cname: str) -> bool:
+                    s = str(cname)
+                    return s.startswith("score_")
+                def is_winner_col(cname: str) -> bool:
+                    return str(cname).startswith("ganador_") or str(cname) == "ganador_columna"
+                def _map_winner_text(v: object) -> str:
+                    if isinstance(v, str):
+                        if v == "PROPUESTA USUARIO":
+                            return "USUARIO"
+                        if v == "PROPUESTA IA":
+                            return "IA"
+                        if v == "IGUALES":
+                            return "IGUALES"
+                    return ""
+                def _fmt_score(val) -> str:
+                    try:
+                        vv = pd.to_numeric(val, errors="coerce")
+                        if pd.isna(vv):
+                            return ""
+                        return f"{float(vv):.2f}"
+                    except Exception:
+                        return ""
+                cols = list(dfpdf.columns)
+                table_data = [[Paragraph(str(c), body) for c in cols]]
+                for _, r in dfpdf.iterrows():
+                    row_cells = []
+                    for c in cols:
+                        v = r.get(c)
+                        if is_winner_col(c):
+                            txt = _map_winner_text(v)
+                        elif is_score_col(c):
+                            txt = _fmt_score(v)
+                        else:
+                            if v is None or (isinstance(v, float) and pd.isna(v)):
+                                txt = ""
+                            else:
+                                txt = str(v)
+                        row_cells.append(Paragraph(txt, body))
+                    table_data.append(row_cells)
+
+                # Column widths relative to page width
+                page_w, page_h = landscape(A4)
+                avail = page_w - (doc.leftMargin + doc.rightMargin)
+                weights = []
+                for c in cols:
+                    if is_winner_col(c):
+                        weights.append(1.2)
+                    elif is_score_col(c):
+                        weights.append(1.0)
+                    else:
+                        weights.append(3.2)
+                total_w = sum(weights)
+                col_widths = [avail * (w/total_w) for w in weights]
+
+                tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+                ts = [
+                    ("GRID", (0,0), (-1,-1), 0.3, GRID),
+                    ("VALIGN", (0,0), (-1,-1), "TOP"),
+                ]
+
+                # Header backgrounds by column (gris para todos; ganador_* fondo blanco con texto negro)
+                for c_idx, cname in enumerate(cols):
+                    bg = HEADER_BG
+                    ts.append(("BACKGROUND", (c_idx, 0), (c_idx, 0), bg))
+                    sname = str(cname)
+                    if sname.startswith("ganador_") or sname == "ganador_columna":
+                        ts.append(("BACKGROUND", (c_idx, 0), (c_idx, 0), rl_colors.white))
+                        ts.append(("TEXTCOLOR", (c_idx, 0), (c_idx, 0), rl_colors.black))
+
+                # Helper for score pairs
+                score_pairs = [
+                    ("score_cliente_vs_usuario_tok", "score_cliente_vs_IA_tok"),
+                    ("score_cliente_vs_usuario_tfidf", "score_cliente_vs_IA_tfidf"),
+                    ("score_cliente_vs_usuario_embed", "score_cliente_vs_IA_embed"),
+                    ("score_cliente_vs_usuario", "score_cliente_vs_IA"),
+                ]
+                pair_map = {}
+                for u,i in score_pairs:
+                    pair_map[u] = (u,i)
+                    pair_map[i] = (u,i)
+
+                def _to_float(v):
+                    try:
+                        vv = pd.to_numeric(v, errors="coerce")
+                        if pd.isna(vv):
+                            return None
+                        return float(vv)
+                    except Exception:
+                        return None
+
+                # Color per cell
+                for r_idx in range(1, len(table_data)):
+                    row = dfpdf.iloc[r_idx-1]
+                    for c_idx, cname in enumerate(cols):
+                        sname = str(cname)
+                        # winner cols
+                        if sname.startswith("ganador_") or sname == "ganador_columna":
+                            val = row.get(cname)
+                            if isinstance(val, str):
+                                if val == "PROPUESTA USUARIO":
+                                    ts.append(("BACKGROUND", (c_idx, r_idx), (c_idx, r_idx), COL_BLUE))
+                                elif val == "PROPUESTA IA":
+                                    ts.append(("BACKGROUND", (c_idx, r_idx), (c_idx, r_idx), COL_ORANGE))
+                                elif val == "IGUALES":
+                                    ts.append(("BACKGROUND", (c_idx, r_idx), (c_idx, r_idx), COL_YELLOW))
+                            continue
+                        # score pairs
+                        if sname in pair_map:
+                            ucol, icol = pair_map[sname]
+                            u = _to_float(row.get(ucol)) if ucol in row.index else None
+                            i = _to_float(row.get(icol)) if icol in row.index else None
+                            if (u is not None) and (i is not None):
+                                if abs(i - u) <= 1e-9:
+                                    ts.append(("BACKGROUND", (c_idx, r_idx), (c_idx, r_idx), COL_YELLOW))
+                                elif (sname == icol and i > u) or (sname == ucol and u > i):
+                                    ts.append(("BACKGROUND", (c_idx, r_idx), (c_idx, r_idx), COL_GREEN))
+                            elif (u is None) ^ (i is None):
+                                # only one valid
+                                ts.append(("BACKGROUND", (c_idx, r_idx), (c_idx, r_idx), COL_GREEN))
+                        # alignment for scores
+                        if sname.startswith("score_"):
+                            ts.append(("ALIGN", (c_idx, r_idx), (c_idx, r_idx), "CENTER"))
+
+                tbl.setStyle(TableStyle(ts))
+                elements = []
+                if title:
+                    elements.append(Paragraph(str(title), styles["Heading2"]))
+                    elements.append(Spacer(1, 10))
+                if df_summary is not None and not df_summary.empty:
+                    # Build summary table
+                    s_cols = list(df_summary.columns)
+                    s_data = [[Paragraph(str(c), body) for c in s_cols]]
+                    for _, rr in df_summary.iterrows():
+                        s_row = []
+                        for c in s_cols:
+                            vv = rr.get(c)
+                            s_row.append(Paragraph(str(vv), body))
+                        s_data.append(s_row)
+                    s_tbl = Table(s_data, repeatRows=1)
+                    s_style = [
+                        ("GRID", (0,0), (-1,-1), 0.3, GRID),
+                        ("BACKGROUND", (0,0), (-1,0), HEADER_BG),
+                        ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ]
+                    # Highlight the larger between "Mejores USUARIO" and "Mejores IA" per row in green
+                    try:
+                        idx_usr = s_cols.index("Mejores USUARIO")
+                        idx_ia = s_cols.index("Mejores IA")
+                        for r_i, rr in enumerate(df_summary.itertuples(index=False), start=1):
+                            try:
+                                v_u = float(rr[idx_usr])
+                            except Exception:
+                                v_u = None
+                            try:
+                                v_i = float(rr[idx_ia])
+                            except Exception:
+                                v_i = None
+                            if v_u is not None and v_i is not None:
+                                if v_u > v_i:
+                                    s_style.append(("BACKGROUND", (idx_usr, r_i), (idx_usr, r_i), COL_GREEN))
+                                elif v_i > v_u:
+                                    s_style.append(("BACKGROUND", (idx_ia, r_i), (idx_ia, r_i), COL_GREEN))
+                                # if equal, no highlight requested
+                    except ValueError:
+                        pass
+                    s_tbl.setStyle(TableStyle(s_style))
+                    elements.append(s_tbl)
+                    elements.append(Spacer(1, 12))
+                elements.append(tbl)
+                doc.build(elements)
+                pdf = buf.getvalue()
+                buf.close()
+                return pdf
+
+            st.subheader("Descargar PDF (paisaje)")
+            try:
+                df_export = df_view.head(int(max_filas)).copy()
+                if _REPORTLAB_AVAILABLE:
+                    fontsize = st.slider("Tamaño de letra (PDF texto)", min_value=5, max_value=14, value=8)
+                    # Construir resumen para PDF
+                    resumen_rows_pdf = []
+                    def _compute_counts_pdf(col_usr: str, col_ia: str):
+                        eps_local = 1e-9
+                        s_ia_loc = pd.to_numeric(df_out.get(col_ia), errors="coerce") if col_ia in df_out.columns else pd.Series([pd.NA]*len(df_out), index=df_out.index)
+                        s_usr_loc = pd.to_numeric(df_out.get(col_usr), errors="coerce") if col_usr in df_out.columns else pd.Series([pd.NA]*len(df_out), index=df_out.index)
+                        valid = s_ia_loc.notna() & s_usr_loc.notna()
+                        ia_w = valid & (s_ia_loc > s_usr_loc)
+                        usr_w = valid & (s_usr_loc > s_ia_loc)
+                        emp = valid & ((s_ia_loc - s_usr_loc).abs() <= eps_local)
+                        return int(pd.to_numeric(usr_w, errors="coerce").fillna(0).sum()), int(pd.to_numeric(ia_w, errors="coerce").fillna(0).sum()), int(pd.to_numeric(emp, errors="coerce").fillna(0).sum())
+
+                    if ("score_cliente_vs_usuario" in df_out.columns) or ("score_cliente_vs_IA" in df_out.columns):
+                        u,i,e = _compute_counts_pdf("score_cliente_vs_usuario", "score_cliente_vs_IA")
+                        resumen_rows_pdf.append({"Método": "Difflib", "Mejores USUARIO": u, "Mejores IA": i, "IGUALES": e})
+                    if ("score_cliente_vs_usuario_tfidf" in df_out.columns) or ("score_cliente_vs_IA_tfidf" in df_out.columns):
+                        u,i,e = _compute_counts_pdf("score_cliente_vs_usuario_tfidf", "score_cliente_vs_IA_tfidf")
+                        resumen_rows_pdf.append({"Método": "TF-IDF (char 3–5)", "Mejores USUARIO": u, "Mejores IA": i, "IGUALES": e})
+                    if ("score_cliente_vs_usuario_tok" in df_out.columns) or ("score_cliente_vs_IA_tok" in df_out.columns):
+                        u,i,e = _compute_counts_pdf("score_cliente_vs_usuario_tok", "score_cliente_vs_IA_tok")
+                        resumen_rows_pdf.append({"Método": "Token Set (RapidFuzz)", "Mejores USUARIO": u, "Mejores IA": i, "IGUALES": e})
+                    if ("score_cliente_vs_usuario_embed" in df_out.columns) or ("score_cliente_vs_IA_embed" in df_out.columns):
+                        u,i,e = _compute_counts_pdf("score_cliente_vs_usuario_embed", "score_cliente_vs_IA_embed")
+                        resumen_rows_pdf.append({"Método": "Embed Cosine (ST)", "Mejores USUARIO": u, "Mejores IA": i, "IGUALES": e})
+
+                    df_resumen_pdf = pd.DataFrame(resumen_rows_pdf) if resumen_rows_pdf else pd.DataFrame()
+                    file_label = getattr(archivo, "name", None)
+                    title_text = f"Resumen general de métodos — Archivo: {file_label}" if file_label else "Resumen general de métodos"
+                    pdf_bytes = dataframe_to_pdf_bytes_reportlab(df_export, df_resumen_pdf, title=title_text, font_size=int(fontsize))
+                else:
+                    st.caption("Para PDF de texto seleccionable instala 'reportlab'. Usando imagen como fallback.")
+                    quality = st.select_slider("Calidad PDF (imagen)", options=["Normal", "Alta", "Máxima"], value="Alta")
+                    scale_map = {"Normal": 1.0, "Alta": 1.5, "Máxima": 2.0}
+                    pdf_bytes = dataframe_to_pdf_bytes_pil(df_export, title=f"{hoja}", scale=scale_map.get(quality, 1.5))
+                st.download_button(
+                    label="Descargar tabla en PDF",
+                    data=pdf_bytes,
+                    file_name="comparacion.pdf",
+                    mime="application/pdf",
+                )
+            except Exception as _e:
+                st.caption(f"No se pudo generar PDF: {_e}")
 
             # Estadísticas de conteo de "buenas" (verde) por columna (sin 'decision')
             if ("score_cliente_vs_usuario" in df_out.columns) or ("score_cliente_vs_IA" in df_out.columns):
